@@ -330,9 +330,13 @@ first=y
 # Read stdin and separate out individual mails
 verbose "Saving incoming mbox in ${mail}/${date}.mbox"
 while IFS= read -r line; do
+	if [ -n "$first" ]; then
+		printf "From aiaiai\n" >> "${mail}/${date}.mbox"
+	fi
 	printf "%s\n" "$line" >> "${mail}/${date}.mbox"
+
 	if printf "%s" "$line" | grep -i -q -- "^From [^@ ]\+@[^@ ]\+ .\+$" || \
-	   printf "%s" "$line" | grep -i -q -- "^From [[:xdigit:]]\{40\} .\+$"; then
+		printf "%s" "$line" | grep -i -q -- "^From [[:xdigit:]]\{40\} .\+$"; then
 		if [ -z "$first" ]; then
 			if [ -n "$prev" ]; then
 				message "The last line of previous mbox is not blank"
@@ -344,6 +348,9 @@ while IFS= read -r line; do
 			truncate -s0 -- "$mbox"
 		fi
 	else
+		if [ -n "$first" ]; then
+			printf "From aiaiai-email-lda" >> "$mbox"
+		fi
 		printf "%s\n" "$prev" >> "$mbox"
 	fi
 	prev="$line"
