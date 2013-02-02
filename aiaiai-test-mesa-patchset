@@ -1,0 +1,388 @@
+#!/bin/bash -fu
+
+# Copyright 2011-2012 Intel Corporation
+# Author: Artem Bityutskiy
+# License: GPLv2
+
+srcdir="$(readlink -ev -- ${0%/*})"
+PATH="$srcdir:$srcdir/external/libshell:$srcdir/external:$PATH"
+
+. shell-error
+. shell-args
+. shell-signal
+. aiaiai-sh-functions
+
+PROG="${0##*/}"
+message_time="yes"
+
+show_usage()
+{
+	cat <<-EOF
+Usage: $PROG [options] <kernel-tree> <defconfig,[arch[,cross]] ...>
+
+<kernel-tree>                   - directory with kernel sources
+<defconfig,[arch[,cross]] ...>  - list of configurations to test.
+
+The mbox file containing the patches to test is expected to come from stdin or
+-i option can be used instead.
+
+The configurations are specified as follows:
+
+  defconfig[,arch[,cross]]
+
+where
+
+  * "defconfig" is the name kernel defconfig file to test
+  * "arch" is the architecture (translates to Kbuild's ARCH variable value)
+  * "cross" is the cross-compiler prefix (translates to Kbuild's CROSS_COMPILE
+     variable value).
+
+For example, the following list of configurations:
+
+  omap2_defconfig,arm,arm-eabi- i386_defconfig,i386 defconfig,s390,s390x-linux-
+
+will make $PROG to test the patch in 3 configurations:
+
+  1. defconfig "omap2_defconfig" with ARCH=arm and CROSS_COMPILE=arm-eabi-
+  2. defconfig "i386_defconfig" with ARCH=arm and the default CROSS_COMPILE
+  3. defconfig "defconfig" with ARCH=s390 and CROSS_COMPILE=s390x-linux-
+
+By default, $PROG assumes that defconfigs are part of the
+kernel tree, unless --confdir option is specified, in which case the defconfig
+files will be searched for only in the specified directory.
+
+Options:
+  -j, --jobs=N           allow to run N jobs simultaneously (default is 1);
+  -c, --commit-id=ID     the commit id to test against (default is the head of
+                         the git tree (HEAD));
+  -i, --input=MBOX       use the MBOX file instead of stdin;
+  -w, --workdir=WDIR     path to the working directory where the kernel will
+                         be built (default: a temporary directory is created
+                         using mktemp);
+  -C, --confdir=CDIR     path to the directory containing the defconfig files
+                         (those you specify at the end); by default the
+                         defconfig files are assumed to be part of the
+                         <kernel-tree>; this option makes it possible to use
+                         stand-alone defconfig files instead;
+  -p, --preserve         preserve all the temporary files - do not clean up;
+      --bisectability    test bisectability;
+      --sparse           check with sparse while building;
+      --smatch           check with smatch while building;
+      --cppcheck         check with cppcheck while building;
+      --coccinelle       check with coccinelle (spatch) while building;
+  -Q  --quick-fixes=F    sometimes it is necessary to carry out-of-tree patches
+                         like quick build fixes and this option allows to pass
+                         an mbox file with quick fixes which will be applied
+                         first and the user patch-set will be tested on top of
+                         the fixes;
+  -K  --keywords=FILE    match keywords from FILE against the patch
+  -M, --kmake-opts       additional options to append to the final kernel
+                         compilation 'make' command
+                         (e.g., W=2 KALLSYMS_EXTRA_PASS=1)
+  -v, --verbose          be verbose;
+  -h, --help             show this text and exit.
+EOF
+}
+
+fail_usage()
+{
+	[ -z "$1" ] || printf "%s\n" "$1"
+	show_usage
+	exit 1
+}
+
+# Print a separator line to stdout (to separate different parts of the test
+# result)
+print_separator()
+{
+	local i=0
+
+	echo
+	while [ $i -lt 80 ]; do
+		i=$(($i+1));
+		printf "=";
+	done
+	echo
+}
+
+
+pid_bisect=
+test_configuration()
+{
+	local config="$1"
+#	local defconfig="$(leave_first "$1")";
+#	local arch="$(leave_second "$1")";
+#	local cross="$(leave_third "$1")";
+
+
+
+	verbose "Building non-patched tree"
+	verbose "   config: $config"
+    verbose "   tree  : $cloned_kernel1"
+	local log1="$tmpdir1/$config"
+	local obj1="$tmpdir1/obj.$config"
+
+	aiaiai-make-mesa $verbose \
+        -o "$obj1" \
+        -j "$jobs" \
+		-O "$log1.stdout.log" \
+        -E "$log1.stderr.log" \
+        -- \
+		"$cloned_kernel1" \
+        $config
+	verbose "Done with non-patched tree"
+
+
+	verbose "Building patched tree"
+	verbose "   config: $config"
+    verbose "   tree  : $cloned_kernel2"
+	local log2="$tmpdir2/$config"
+	local obj2="$tmpdir2/obj.$config"
+
+	aiaiai-make-mesa $verbose \
+        -o "$obj2" \
+        -j "$jobs" \
+		-O "$log2.stdout.log" \
+        -E "$log2.stderr.log" \
+        -- \
+		"$cloned_kernel2" \
+        $config
+	verbose "Done with patched tree"
+
+
+#	aiaiai-diff-log $verbose $preserve "$tmpdir/diff-for-diff-log" "$log1.stderr.log" \
+#		-w "$tmpdir" "$log2.stderr.log" > "$tmpdir/$config.stderr.diff"
+}
+
+tmpdir=
+preserve=
+cleanup_handler()
+{
+	if [ -n "$preserve" ]; then
+		message "Preserved tmpdir: $tmpdir"
+	else
+		[ -z "$tmpdir" ] || verbose "Removing $tmpdir";
+		#rm -rf -- "$tmpdir" >&2
+	fi
+
+	# Just in case we were interrupted, kill all our children
+	local child
+        for child in $(ps -o pid --no-headers --ppid "$$"); do
+		kill "$child" > /dev/null 2>&1 ||:
+        done
+}
+set_cleanup_handler cleanup_handler
+
+TEMP=`getopt -n $PROG -o j:,c:,i:,w:,C:,p,Q:,K:,M:,v,h --long jobs:,commit-id:,input:,workdir:,confdir:,preserve,bisectability,cppcheck,quick-fixes:,keywords:,kmake-opts:,verbose,help -- "$@"` ||
+	fail_usage ""
+eval set -- "$TEMP"
+
+jobs=1
+confdir=
+commit_id1=HEAD
+mbox=
+bisectability=
+sparse=
+smatch=
+cppcheck=
+coccinelle=
+quick_fixes=
+keywords=
+kmake_opts=
+verbose=
+quiet="-q"
+
+while true; do
+	case "$1" in
+	-j|--jobs)
+		jobs=$(opt_check_number "$1" "$2")
+		shift
+		;;
+	-c|--commit-id)
+		commit_id1="$2"
+		shift
+		;;
+	-i|--input)
+		mbox="$(opt_check_read "$1" "$2")"
+		shift
+		;;
+	-w|--workdir)
+		mkdir $verbose -p -- "$2" >&2
+		tmpdir="$(mktemp --tmpdir="$(readlink -fv -- "$2")" -dt "$PROG.XXXX")"
+		shift
+		;;
+	-C|--confdir)
+		confdir="$(opt_check_dir "$1" "$2")"
+		shift
+		;;
+	-p|--preserve)
+		preserve="--preserve"
+		;;
+	-Q|--quick-fixes)
+		quick_fixes="$(opt_check_read "$1" "$2")"
+		shift
+		;;
+	--bisectability)
+		bisectability="--bisectability"
+		;;
+	-K|--keywords)
+		keywords="$(opt_check_read "$1" "$2")"
+		shift
+		;;
+	-M|--kmake-opts)
+		kmake_opts="$2"
+		shift
+		;;
+	-v|--verbose)
+		verbose=-v
+		quiet=
+		;;
+	-h|--help)
+		show_usage
+		exit 0
+		;;
+	--) shift; break
+                ;;
+	*) fail_usage "Unrecognized option: $1"
+		;;
+	esac
+	shift
+done
+
+[ "$#" -ge 2 ] || fatal 'Insufficient arguments'
+
+kernel_tree="$(readlink -ev -- "$1")"; shift
+defconfigs="$@"
+
+# Make sure external programs we depend on are installed
+msg="You probably did not compile it, run 'make' in the topmost aiaiai source code directory"
+program_required "remap-log" "$msg"
+program_required "aiaiai-locker" "$msg"
+program_required "git" ""
+program_required "make" ""
+program_required "patch" ""
+program_required "formail" ""
+program_required "python" ""
+program_required "diff" ""
+
+[ -n "$tmpdir" ] || tmpdir="$(mktemp -dt "$PROG.XXXX")"
+tmpdir1="$tmpdir/before"
+tmpdir2="$tmpdir/after"
+mkdir -p $verbose "$tmpdir1" "$tmpdir2" >&2
+
+# Save the mbox to a temporary file if it comes from stdin
+if [ -z "$mbox" ]; then
+	mbox="$tmpdir/mbox"
+	cat > "$mbox"
+else
+	cp $verbose "$mbox" "$tmpdir/mbox" >&2
+	mbox="$tmpdir/mbox"
+fi
+
+cloned_kernel2="$tmpdir2/src"
+git clone "${verbose:--q}" "$kernel_tree" "$cloned_kernel2" >&2
+cd "$cloned_kernel2"
+
+# Reset to the base commit id
+commit_id1="$(git --git-dir="$kernel_tree/.git" rev-parse "$commit_id1^{commit}")"
+#verbose "Base commit: $(git log -1 --oneline "$commit_id1")"
+git reset $quiet --hard "$commit_id1" >&2
+
+# Apply quick fixes
+if [ -n "$quick_fixes" ]; then
+	verbose "Applying quick fixes from $quick_fixes"
+	git apply "$quick_fixes" >&2
+	git add -A >&2
+	git commit $quiet -m "Quick fixes - applied by aiaiai" >&2
+	commit_id1="$(git rev-parse "HEAD^{commit}")"
+	verbose "Quick fixes applied"
+fi
+
+# Apply the patch
+apply_patch < "$mbox" || {
+    exit 70
+}
+
+commit_id2="$(git rev-parse "HEAD^{commit}")"
+verbose "Commit after applying the patch(es): $(git log -1 --oneline "$commit_id2")"
+
+# Re-generate the patch. Note, we prefer to not use the input mbox directly
+# because it may be encoded (e.g., with quoted-printable).
+#
+git format-patch -M --patience --stdout "$commit_id1".."$commit_id2" > "$mbox"
+
+# Generate a diff for aiaiai-diff-log
+git diff -U0 -M "$commit_id1".."$commit_id2" > "$tmpdir/diff-for-diff-log"
+
+# Generate the list of modified files
+mod_files="$tmpdir/mod_files"
+git diff --numstat $commit_id1..$commit_id2 |
+	sed -e 's/[[:digit:][:space:]]\+//' > "$mod_files"
+
+# Clone another copy of the kernel tree
+cloned_kernel1="$tmpdir1/src"
+verbose "Cloning $cloned_kernel2 in $cloned_kernel1"
+git clone "${verbose:--q}" "$cloned_kernel2" "$cloned_kernel1" >&2
+cd "$cloned_kernel1"
+verbose "we're in $cloned_kernel1"
+
+# Main loop for testing all configurations
+for defconfig in $defconfigs; do
+	test_configuration "$defconfig"
+done
+
+# Check defconfigs - use the second copy of the kernel because the first one is
+# used by 'aiaiai-test-bisectability'.
+#aiaiai-test-defconfigs $verbose $preserve -c "$commit_id1" -i "$mbox" -w "$tmpdir" \
+#	--dont-clone "$cloned_kernel2" > "$tmpdir/test-defconfigs.results"
+
+#[ -z "$pid_bisect" ]   || wait "$pid_bisect"   || fatal "aiaiai-test-bisectability failed"
+
+# Print the results
+
+print_separator
+echo "Tested the patch(es) on top of the following commits:"
+git --no-pager log -7 --oneline "$commit_id1"
+
+code=0
+for defconfig in $defconfigs; do
+	log1="$tmpdir1/$defconfig.stderr.log"
+	log2="$tmpdir2/$defconfig.stderr.log"
+
+	print_separator
+
+	# Make kernel appends a "FAILURE" string at the end when builds fail
+	if build_failed "$log1"; then
+		build_failure "$defconfig" "$commit_id1" < "$log1"
+        code=70
+		continue
+	fi
+
+	if build_failed "$log2"; then
+		build_failure "$defconfig" "$commit_id2" < "$log2"
+        code=70
+		continue
+	fi
+
+	if [ -n "$bisectability" ] && [ -s "$tmpdir/$defconfig.bisect.results" ]; then
+		printf "\n%s\n\n" "Bisectability test results for configuration \"$defconfig\""
+		cat "$tmpdir/$defconfig.bisect.results"
+		print_separator
+	fi
+
+	if [ -s "$tmpdir/$defconfig.stderr.diff" ]; then
+		printf "\n%s\n\n" "Successfully built configuration \"$defconfig\", results:"
+		cat "$tmpdir/$defconfig.stderr.diff"
+	else
+		printf "\n%s\n" "Successfully built configuration \"$defconfig\", no issues"
+	fi
+done
+
+if [ -s "$tmpdir/test-defconfigs.results" ]; then
+	print_separator
+	printf "\n%s\n\n" "Defconfig issues detected:"
+	cat "$tmpdir/test-defconfigs.results"
+fi
+
+print_separator
+exit $code
